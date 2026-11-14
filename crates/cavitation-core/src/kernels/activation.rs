@@ -1148,6 +1148,25 @@ mod tests {
         }
     }
 
+    /// Softplus gives a value the same bits whatever the slice's length and the value's
+    /// place in it, across the SSE4.2 kernel's blocks of 16 values, its single vectors and
+    /// its padded tail.
+    #[test]
+    fn softplus_does_not_depend_on_position() {
+        let xs: Vec<f32> = (0..53).map(|i| -9.0 + 0.37 * i as f32).collect();
+        for level in levels() {
+            for len in 0..=xs.len() {
+                let mut all = xs[..len].to_vec();
+                softplus_f32_with(level, &mut all);
+                for (i, &x) in xs[..len].iter().enumerate() {
+                    let mut one = [x];
+                    softplus_f32_with(level, &mut one);
+                    assert_eq!(one[0].to_bits(), all[i].to_bits(), "{level}: {len} {i}");
+                }
+            }
+        }
+    }
+
     /// ELU keeps the sign of a zero at every level (`alpha · (e^±0 − 1)` is `alpha · ±0`),
     /// and is `alpha · x` for an input below `EXPM1_TINY` in size; SELU and CELU follow.
     #[test]

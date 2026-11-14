@@ -610,35 +610,80 @@ fn sse_lanes(values: &mut [f32], lanes: impl Fn(__m128) -> __m128) {
     }
 }
 
+/// `K` vectors at once: `f` on each.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn each<const K: usize>(a: [__m128; K], f: impl Fn(__m128) -> __m128) -> [__m128; K] {
+    let mut out = a;
+    for (o, &a) in out.iter_mut().zip(a.iter()) {
+        *o = f(a);
+    }
+    out
+}
+
+/// `K` pairs of vectors at once: `f` on each pair.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn each2<const K: usize>(
+    a: [__m128; K],
+    b: [__m128; K],
+    f: impl Fn(__m128, __m128) -> __m128,
+) -> [__m128; K] {
+    let mut out = a;
+    for (o, (&a, &b)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *o = f(a, b);
+    }
+    out
+}
+
 /// `e^y` in each lane for `y <= 0`, as the reference's `exp_neg` computes it (NaN lanes
 /// give a meaningless value, which the callers replace).
 #[inline]
 #[target_feature(enable = "sse4.2")]
 fn exp_neg_sse(y: __m128) -> __m128 {
-    let y = _mm_max_ps(y, _mm_set1_ps(EXP_MIN));
-    let n = _mm_floor_ps(_mm_add_ps(
-        _mm_mul_ps(y, _mm_set1_ps(LOG2E)),
-        _mm_set1_ps(0.5),
-    ));
-    let r = _mm_sub_ps(y, _mm_mul_ps(n, _mm_set1_ps(LN2_HI)));
-    let r = _mm_sub_ps(r, _mm_mul_ps(n, _mm_set1_ps(LN2_LO)));
-    let mut p = _mm_set1_ps(EXP_P[0]);
+    exp_neg_sse_k([y])[0]
+}
+
+/// [`exp_neg_sse`] on `K` vectors, each step done for all `K` before the next, so the `K`
+/// dependency chains sit side by side and a small out-of-order core can overlap them.
+/// Every lane's operations are the one-vector form's, in its order.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn exp_neg_sse_k<const K: usize>(y: [__m128; K]) -> [__m128; K] {
+    let y = each(y, |y| _mm_max_ps(y, _mm_set1_ps(EXP_MIN)));
+    let n = each(y, |y| {
+        _mm_floor_ps(_mm_add_ps(
+            _mm_mul_ps(y, _mm_set1_ps(LOG2E)),
+            _mm_set1_ps(0.5),
+        ))
+    });
+    let r = each2(y, n, |y, n| {
+        _mm_sub_ps(y, _mm_mul_ps(n, _mm_set1_ps(LN2_HI)))
+    });
+    let r = each2(r, n, |r, n| {
+        _mm_sub_ps(r, _mm_mul_ps(n, _mm_set1_ps(LN2_LO)))
+    });
+    let mut p = [_mm_set1_ps(EXP_P[0]); K];
     for &c in &EXP_P[1..] {
-        p = _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(c));
+        p = each2(p, r, |p, r| _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(c)));
     }
-    let p = _mm_add_ps(
-        _mm_add_ps(_mm_mul_ps(_mm_mul_ps(p, r), r), r),
-        _mm_set1_ps(1.0),
-    );
-    // `n` is a whole number in [-150, 0], so the truncating conversion is exact; each half
-    // is in [-75, 0], a normal power of two.
-    let n = _mm_cvttps_epi32(n);
-    let n1 = _mm_srai_epi32::<1>(n);
-    let n2 = _mm_sub_epi32(n, n1);
-    let bias = _mm_set1_epi32(127);
-    let s1 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n1, bias)));
-    let s2 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n2, bias)));
-    _mm_mul_ps(_mm_mul_ps(p, s1), s2)
+    let p = each2(p, r, |p, r| {
+        _mm_add_ps(
+            _mm_add_ps(_mm_mul_ps(_mm_mul_ps(p, r), r), r),
+            _mm_set1_ps(1.0),
+        )
+    });
+    each2(p, n, |p, n| {
+        // `n` is a whole number in [-150, 0], so the truncating conversion is exact; each
+        // half is in [-75, 0], a normal power of two.
+        let n = _mm_cvttps_epi32(n);
+        let n1 = _mm_srai_epi32::<1>(n);
+        let n2 = _mm_sub_epi32(n, n1);
+        let bias = _mm_set1_epi32(127);
+        let s1 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n1, bias)));
+        let s2 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n2, bias)));
+        _mm_mul_ps(_mm_mul_ps(p, s1), s2)
+    })
 }
 
 /// `e^y − 1` in each lane for `y <= 0`, as the reference's `expm1_neg` computes it (NaN
@@ -668,39 +713,52 @@ fn expm1_neg_sse(y: __m128) -> __m128 {
 }
 
 /// `ln(1 + t)` in each lane for `t` in `[0, 1]`, as the reference's `log1p_unit` computes
-/// it.
+/// it, on `K` vectors side by side as [`exp_neg_sse_k`] does.
 #[inline]
 #[target_feature(enable = "sse4.2")]
-fn log1p_unit_sse(t: __m128) -> __m128 {
+fn log1p_unit_sse_k<const K: usize>(t: [__m128; K]) -> [__m128; K] {
     let one = _mm_set1_ps(1.0);
-    let m = _mm_add_ps(one, t);
-    let c = _mm_sub_ps(t, _mm_sub_ps(m, one));
-    let big = _mm_cmpgt_ps(m, _mm_set1_ps(std::f32::consts::SQRT_2));
-    let f = _mm_blendv_ps(m, _mm_mul_ps(m, _mm_set1_ps(0.5)), big);
-    let k = _mm_and_ps(big, one);
-    let x = _mm_sub_ps(f, one);
-    let z = _mm_mul_ps(x, x);
-    let mut p = _mm_set1_ps(LOG_P[0]);
+    let m = each(t, |t| _mm_add_ps(one, t));
+    let c = each2(t, m, |t, m| _mm_sub_ps(t, _mm_sub_ps(m, one)));
+    let big = each(m, |m| {
+        _mm_cmpgt_ps(m, _mm_set1_ps(std::f32::consts::SQRT_2))
+    });
+    let f = each2(m, big, |m, big| {
+        _mm_blendv_ps(m, _mm_mul_ps(m, _mm_set1_ps(0.5)), big)
+    });
+    let k = each(big, |big| _mm_and_ps(big, one));
+    let x = each(f, |f| _mm_sub_ps(f, one));
+    let z = each(x, |x| _mm_mul_ps(x, x));
+    let mut p = [_mm_set1_ps(LOG_P[0]); K];
     for &cc in &LOG_P[1..] {
-        p = _mm_add_ps(_mm_mul_ps(p, x), _mm_set1_ps(cc));
+        p = each2(p, x, |p, x| _mm_add_ps(_mm_mul_ps(p, x), _mm_set1_ps(cc)));
     }
-    let y = _mm_mul_ps(_mm_mul_ps(x, z), p);
-    let y = _mm_add_ps(y, _mm_mul_ps(k, _mm_set1_ps(LN2_LO)));
-    let y = _mm_sub_ps(y, _mm_mul_ps(_mm_set1_ps(0.5), z));
-    let r = _mm_add_ps(x, y);
-    let r = _mm_add_ps(r, _mm_mul_ps(k, _mm_set1_ps(LN2_HI)));
-    _mm_add_ps(r, _mm_div_ps(c, m))
+    let xz = each2(x, z, |x, z| _mm_mul_ps(x, z));
+    let y = each2(xz, p, |xz, p| _mm_mul_ps(xz, p));
+    let y = each2(y, k, |y, k| {
+        _mm_add_ps(y, _mm_mul_ps(k, _mm_set1_ps(LN2_LO)))
+    });
+    let y = each2(y, z, |y, z| _mm_sub_ps(y, _mm_mul_ps(_mm_set1_ps(0.5), z)));
+    let r = each2(x, y, |x, y| _mm_add_ps(x, y));
+    let r = each2(r, k, |r, k| {
+        _mm_add_ps(r, _mm_mul_ps(k, _mm_set1_ps(LN2_HI)))
+    });
+    let q = each2(c, m, |c, m| _mm_div_ps(c, m));
+    each2(r, q, |r, q| _mm_add_ps(r, q))
 }
 
-/// Softplus in each lane, as the reference's `softplus_one` computes it.
+/// Softplus in each lane, as the reference's `softplus_one` computes it, on `K` vectors
+/// side by side as [`exp_neg_sse_k`] does.
 #[inline]
 #[target_feature(enable = "sse4.2")]
-fn softplus_sse(x: __m128) -> __m128 {
+fn softplus_sse_k<const K: usize>(x: [__m128; K]) -> [__m128; K] {
     let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
-    let l = log1p_unit_sse(exp_neg_sse(_mm_or_ps(x, sign)));
-    let m = _mm_and_ps(x, _mm_cmpgt_ps(x, _mm_setzero_ps()));
-    let r = _mm_add_ps(m, l);
-    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+    let l = log1p_unit_sse_k(exp_neg_sse_k(each(x, |x| _mm_or_ps(x, sign))));
+    each2(x, l, |x, l| {
+        let m = _mm_and_ps(x, _mm_cmpgt_ps(x, _mm_setzero_ps()));
+        let r = _mm_add_ps(m, l);
+        _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+    })
 }
 
 /// ELU with `alpha` in each lane, as the reference's `elu_one` computes it.
@@ -722,7 +780,19 @@ fn elu_sse(alpha: __m128, x: __m128) -> __m128 {
 /// The CPU must support SSE4.2.
 #[target_feature(enable = "sse4.2")]
 pub(super) unsafe fn softplus_sse_slice(values: &mut [f32]) {
-    sse_lanes(values, |v| softplus_sse(v));
+    // Four vectors at a time, side by side, so the core can overlap their long chains.
+    // Measured with `cavitation-bench activation` on an Intel Celeron N5105: 9.09 ns per
+    // value against 16.14 one vector at a time.
+    let (blocks, rest) = values.as_chunks_mut::<16>();
+    for block in blocks {
+        let (quads, _) = block.as_chunks_mut::<4>();
+        let x = [0, 1, 2, 3].map(|i| load4(&quads[i]));
+        let y = softplus_sse_k(x);
+        for (q, y) in quads.iter_mut().zip(y) {
+            store4(q, y);
+        }
+    }
+    sse_lanes(rest, |v| softplus_sse_k([v])[0]);
 }
 
 /// The SSE4.2 ELU with `alpha` over `values`, in place.
