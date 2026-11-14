@@ -581,8 +581,8 @@ unsafe fn avx2_rows<const R: usize, const FIRST: bool>(job: &Job, i0: usize, out
 #[target_feature(enable = "sse4.2")]
 pub(super) unsafe fn activation_sse(func: Func, values: &mut [f32]) {
     match func {
-        Func::Tanh => sse_lanes(values, |v| tanh_sse(v)),
-        Func::Sigmoid => sse_lanes(values, |v| sigmoid_sse(v)),
+        Func::Tanh => sse_quads(values, |x| tanh_sse_k(x), |v| tanh_sse(v)),
+        Func::Sigmoid => sse_quads(values, |x| sigmoid_sse_k(x), |v| sigmoid_sse(v)),
     }
 }
 
@@ -637,16 +637,10 @@ fn each2<const K: usize>(
 }
 
 /// `e^y` in each lane for `y <= 0`, as the reference's `exp_neg` computes it (NaN lanes
-/// give a meaningless value, which the callers replace).
-#[inline]
-#[target_feature(enable = "sse4.2")]
-fn exp_neg_sse(y: __m128) -> __m128 {
-    exp_neg_sse_k([y])[0]
-}
-
-/// [`exp_neg_sse`] on `K` vectors, each step done for all `K` before the next, so the `K`
-/// dependency chains sit side by side and a small out-of-order core can overlap them.
-/// Every lane's operations are the one-vector form's, in its order.
+/// give a meaningless value, which the callers replace), on `K` vectors: each step is done
+/// for all `K` before the next, so the `K` dependency chains sit side by side and a small
+/// out-of-order core can overlap them. Every lane performs the reference's operations in
+/// its order, whatever `K` is.
 #[inline]
 #[target_feature(enable = "sse4.2")]
 fn exp_neg_sse_k<const K: usize>(y: [__m128; K]) -> [__m128; K] {
@@ -687,29 +681,38 @@ fn exp_neg_sse_k<const K: usize>(y: [__m128; K]) -> [__m128; K] {
 }
 
 /// `e^y − 1` in each lane for `y <= 0`, as the reference's `expm1_neg` computes it (NaN
-/// lanes give a meaningless value, which the callers replace).
+/// lanes give a meaningless value, which the callers replace), on `K` vectors side by side
+/// as [`exp_neg_sse_k`] does.
 #[inline]
 #[target_feature(enable = "sse4.2")]
-fn expm1_neg_sse(y: __m128) -> __m128 {
-    let low = _mm_cmplt_ps(y, _mm_set1_ps(EXPM1_MIN));
-    let y = _mm_max_ps(y, _mm_set1_ps(EXPM1_MIN));
-    let n = _mm_floor_ps(_mm_add_ps(
-        _mm_mul_ps(y, _mm_set1_ps(LOG2E)),
-        _mm_set1_ps(0.5),
-    ));
-    let r = _mm_sub_ps(y, _mm_mul_ps(n, _mm_set1_ps(LN2_HI)));
-    let r = _mm_sub_ps(r, _mm_mul_ps(n, _mm_set1_ps(LN2_LO)));
-    let mut p = _mm_set1_ps(EXP_P[0]);
+fn expm1_neg_sse_k<const K: usize>(y: [__m128; K]) -> [__m128; K] {
+    let low = each(y, |y| _mm_cmplt_ps(y, _mm_set1_ps(EXPM1_MIN)));
+    let y = each(y, |y| _mm_max_ps(y, _mm_set1_ps(EXPM1_MIN)));
+    let n = each(y, |y| {
+        _mm_floor_ps(_mm_add_ps(
+            _mm_mul_ps(y, _mm_set1_ps(LOG2E)),
+            _mm_set1_ps(0.5),
+        ))
+    });
+    let r = each2(y, n, |y, n| {
+        _mm_sub_ps(y, _mm_mul_ps(n, _mm_set1_ps(LN2_HI)))
+    });
+    let r = each2(r, n, |r, n| {
+        _mm_sub_ps(r, _mm_mul_ps(n, _mm_set1_ps(LN2_LO)))
+    });
+    let mut p = [_mm_set1_ps(EXP_P[0]); K];
     for &c in &EXP_P[1..] {
-        p = _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(c));
+        p = each2(p, r, |p, r| _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(c)));
     }
-    let q = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(p, r), r), r);
-    // `n` is a whole number in [-25, 0], so the truncating conversion is exact and `2^n`
-    // a normal power of two.
-    let n = _mm_cvttps_epi32(n);
-    let s = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n, _mm_set1_epi32(127))));
-    let v = _mm_add_ps(_mm_mul_ps(q, s), _mm_sub_ps(s, _mm_set1_ps(1.0)));
-    _mm_blendv_ps(v, _mm_set1_ps(-1.0), low)
+    let q = each2(p, r, |p, r| _mm_add_ps(_mm_mul_ps(_mm_mul_ps(p, r), r), r));
+    let v = each2(q, n, |q, n| {
+        // `n` is a whole number in [-25, 0], so the truncating conversion is exact and
+        // `2^n` a normal power of two.
+        let n = _mm_cvttps_epi32(n);
+        let s = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n, _mm_set1_epi32(127))));
+        _mm_add_ps(_mm_mul_ps(q, s), _mm_sub_ps(s, _mm_set1_ps(1.0)))
+    });
+    each2(v, low, |v, low| _mm_blendv_ps(v, _mm_set1_ps(-1.0), low))
 }
 
 /// `ln(1 + t)` in each lane for `t` in `[0, 1]`, as the reference's `log1p_unit` computes
@@ -761,16 +764,20 @@ fn softplus_sse_k<const K: usize>(x: [__m128; K]) -> [__m128; K] {
     })
 }
 
-/// ELU with `alpha` in each lane, as the reference's `elu_one` computes it.
+/// ELU with `alpha` in each lane, as the reference's `elu_one` computes it, on `K` vectors
+/// side by side as [`exp_neg_sse_k`] does.
 #[inline]
 #[target_feature(enable = "sse4.2")]
-fn elu_sse(alpha: __m128, x: __m128) -> __m128 {
-    let neg = _mm_mul_ps(alpha, expm1_neg_sse(_mm_min_ps(x, _mm_setzero_ps())));
-    let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
-    let tiny = _mm_cmplt_ps(_mm_andnot_ps(sign, x), _mm_set1_ps(EXPM1_TINY));
-    let neg = _mm_blendv_ps(neg, _mm_mul_ps(alpha, x), tiny);
-    let r = _mm_blendv_ps(neg, x, _mm_cmpgt_ps(x, _mm_setzero_ps()));
-    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+fn elu_sse_k<const K: usize>(alpha: __m128, x: [__m128; K]) -> [__m128; K] {
+    let e = expm1_neg_sse_k(each(x, |x| _mm_min_ps(x, _mm_setzero_ps())));
+    each2(x, e, |x, e| {
+        let neg = _mm_mul_ps(alpha, e);
+        let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
+        let tiny = _mm_cmplt_ps(_mm_andnot_ps(sign, x), _mm_set1_ps(EXPM1_TINY));
+        let neg = _mm_blendv_ps(neg, _mm_mul_ps(alpha, x), tiny);
+        let r = _mm_blendv_ps(neg, x, _mm_cmpgt_ps(x, _mm_setzero_ps()));
+        _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+    })
 }
 
 /// The SSE4.2 softplus over `values`, in place.
@@ -783,16 +790,28 @@ pub(super) unsafe fn softplus_sse_slice(values: &mut [f32]) {
     // Four vectors at a time, side by side, so the core can overlap their long chains.
     // Measured with `cavitation-bench activation` on an Intel Celeron N5105: 9.09 ns per
     // value against 16.14 one vector at a time.
+    sse_quads(values, |x| softplus_sse_k(x), |v| softplus_sse_k([v])[0]);
+}
+
+/// Runs `quad` over `values` sixteen at a time, as four vectors side by side, and `one`
+/// over the rest through [`sse_lanes`]. `quad` must compute each vector as `one` does, so a
+/// value's result does not depend on its place in the slice.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn sse_quads(
+    values: &mut [f32],
+    quad: impl Fn([__m128; 4]) -> [__m128; 4],
+    one: impl Fn(__m128) -> __m128,
+) {
     let (blocks, rest) = values.as_chunks_mut::<16>();
     for block in blocks {
         let (quads, _) = block.as_chunks_mut::<4>();
         let x = [0, 1, 2, 3].map(|i| load4(&quads[i]));
-        let y = softplus_sse_k(x);
-        for (q, y) in quads.iter_mut().zip(y) {
+        for (q, y) in quads.iter_mut().zip(quad(x)) {
             store4(q, y);
         }
     }
-    sse_lanes(rest, |v| softplus_sse_k([v])[0]);
+    sse_lanes(rest, one);
 }
 
 /// The SSE4.2 ELU with `alpha` over `values`, in place.
@@ -803,44 +822,66 @@ pub(super) unsafe fn softplus_sse_slice(values: &mut [f32]) {
 #[target_feature(enable = "sse4.2")]
 pub(super) unsafe fn elu_sse_slice(alpha: f32, values: &mut [f32]) {
     let a = _mm_set1_ps(alpha);
-    sse_lanes(values, |v| elu_sse(a, v));
+    sse_quads(values, |x| elu_sse_k(a, x), |v| elu_sse_k(a, [v])[0]);
 }
 
 /// `tanh` in each lane, as the reference's `tanh_one` computes it.
 #[inline]
 #[target_feature(enable = "sse4.2")]
 fn tanh_sse(x: __m128) -> __m128 {
+    tanh_sse_k([x])[0]
+}
+
+/// [`tanh_sse`] on `K` vectors, the exponential through [`exp_neg_sse_k`] so the `K` chains
+/// sit side by side; every lane's operations are the one-vector form's.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn tanh_sse_k<const K: usize>(x: [__m128; K]) -> [__m128; K] {
     let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
-    let one = _mm_set1_ps(1.0);
-    let a = _mm_andnot_ps(sign, x);
-    let s = _mm_mul_ps(a, a);
-    let mut q = _mm_set1_ps(TANH_Q[0]);
-    for &c in &TANH_Q[1..] {
-        q = _mm_add_ps(_mm_mul_ps(q, s), _mm_set1_ps(c));
-    }
-    let small = _mm_add_ps(a, _mm_mul_ps(a, _mm_mul_ps(s, q)));
-    let e = exp_neg_sse(_mm_mul_ps(_mm_set1_ps(-2.0), a));
-    let big = _mm_div_ps(_mm_sub_ps(one, e), _mm_add_ps(one, e));
-    let r = _mm_blendv_ps(big, small, _mm_cmplt_ps(a, _mm_set1_ps(TANH_SMALL)));
-    let r = _mm_or_ps(r, _mm_and_ps(sign, x));
-    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+    let e = exp_neg_sse_k(each(x, |x| {
+        _mm_mul_ps(_mm_set1_ps(-2.0), _mm_andnot_ps(sign, x))
+    }));
+    each2(x, e, |x, e| {
+        let one = _mm_set1_ps(1.0);
+        let a = _mm_andnot_ps(sign, x);
+        let s = _mm_mul_ps(a, a);
+        let mut q = _mm_set1_ps(TANH_Q[0]);
+        for &c in &TANH_Q[1..] {
+            q = _mm_add_ps(_mm_mul_ps(q, s), _mm_set1_ps(c));
+        }
+        let small = _mm_add_ps(a, _mm_mul_ps(a, _mm_mul_ps(s, q)));
+        let big = _mm_div_ps(_mm_sub_ps(one, e), _mm_add_ps(one, e));
+        let r = _mm_blendv_ps(big, small, _mm_cmplt_ps(a, _mm_set1_ps(TANH_SMALL)));
+        let r = _mm_or_ps(r, _mm_and_ps(sign, x));
+        _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+    })
 }
 
 /// The logistic sigmoid in each lane, as the reference's `sigmoid_one` computes it.
 #[inline]
 #[target_feature(enable = "sse4.2")]
 fn sigmoid_sse(x: __m128) -> __m128 {
+    sigmoid_sse_k([x])[0]
+}
+
+/// [`sigmoid_sse`] on `K` vectors, the exponential through [`exp_neg_sse_k`] so the `K`
+/// chains sit side by side; every lane's operations are the one-vector form's.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn sigmoid_sse_k<const K: usize>(x: [__m128; K]) -> [__m128; K] {
     let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
-    let one = _mm_set1_ps(1.0);
     // `-|x|`: `x` with its sign bit set.
-    let e = exp_neg_sse(_mm_or_ps(x, sign));
-    let d = _mm_add_ps(one, e);
-    let r = _mm_blendv_ps(
-        _mm_div_ps(e, d),
-        _mm_div_ps(one, d),
-        _mm_cmpge_ps(x, _mm_setzero_ps()),
-    );
-    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+    let e = exp_neg_sse_k(each(x, |x| _mm_or_ps(x, sign)));
+    each2(x, e, |x, e| {
+        let one = _mm_set1_ps(1.0);
+        let d = _mm_add_ps(one, e);
+        let r = _mm_blendv_ps(
+            _mm_div_ps(e, d),
+            _mm_div_ps(one, d),
+            _mm_cmpge_ps(x, _mm_setzero_ps()),
+        );
+        _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+    })
 }
 
 /// The AVX2 `tanh` or sigmoid kernel over `values`, in place, eight lanes at a time (the
